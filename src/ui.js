@@ -1277,6 +1277,28 @@ export function renderHtml() {
     }
   };
 
+  function normalizeImportedJsonItem(raw, groupMap = {}) {
+    if (!raw || typeof raw !== "object") return null;
+    if (raw.type && String(raw.type).toUpperCase() !== "TOTP") return null;
+    const rawAlgo = String(raw.algo || raw.algorithm || "SHA-1").toUpperCase().replace("-", "");
+    const algo = rawAlgo === "SHA256" ? "SHA-256" : rawAlgo === "SHA512" ? "SHA-512" : "SHA-1";
+    const groupTag = raw.groupId && groupMap[raw.groupId] ? groupMap[raw.groupId] : "";
+    const issuer = String(raw.issuer || raw.name || raw.account || "Unnamed").trim();
+    const account = String(raw.account ?? raw.name ?? "").trim();
+    const secret = String(raw.secret || "").replace(/\\s+/g, "").toUpperCase();
+    if (!secret) return null;
+    return {
+      issuer,
+      account: account === issuer && !raw.account ? "" : account,
+      secret,
+      digits: Number(raw.digits) === 8 ? 8 : 6,
+      period: Math.max(10, Math.min(120, Number(raw.period || 30) || 30)),
+      algo,
+      tag: String(raw.tag || groupTag || "").trim(),
+      pinned: Boolean(raw.pinned),
+    };
+  }
+
   $("btnRunImport").onclick = async () => {
     const errEl = $("ioErr");
     errEl.classList.add("hidden");
@@ -1285,17 +1307,33 @@ export function renderHtml() {
     try {
       let parsedItems = [];
       if (raw.startsWith("{") || raw.startsWith("[")) {
-        const json = JSON.parse(raw);
-        const arr = Array.isArray(json) ? json : json.items;
-        if (!Array.isArray(arr)) throw new Error("JSON 备份格式无效");
-        parsedItems = arr;
+        const cleanedJson = raw.replace(/,\\s*([}\\]])/g, "$1");
+        const json = JSON.parse(cleanedJson);
+        const groupMap = {};
+        if (Array.isArray(json.groups)) {
+          for (const g of json.groups) {
+            if (g && g.id != null) groupMap[g.id] = String(g.name || g.title || "").trim();
+          }
+        }
+        const arr = Array.isArray(json)
+          ? json
+          : Array.isArray(json.items)
+          ? json.items
+          : Array.isArray(json.accounts)
+          ? json.accounts
+          : null;
+        if (!Array.isArray(arr)) throw new Error("JSON 备份格式无效（需要 items、accounts 或数组）");
+        for (const entry of arr) {
+          const norm = normalizeImportedJsonItem(entry, groupMap);
+          if (norm) parsedItems.push(norm);
+        }
       } else {
         const lines = raw.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);
         for (const line of lines) {
           parsedItems.push(...parseAnyOtpInput(line));
         }
       }
-      if (!parsedItems.length) throw new Error("未找到可导入的 2FA 令牌");
+      if (!parsedItems.length) throw new Error("未找到可导入的 TOTP 2FA 令牌");
       const res = await api("/api/tokens/import", {
         method: "POST",
         body: JSON.stringify({ items: parsedItems }),
