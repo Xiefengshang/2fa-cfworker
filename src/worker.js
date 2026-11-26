@@ -9,10 +9,12 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 let schemaReady = false;
+let cachedSessionKey = { id: "", key: null };
+let cachedAesKey = { id: "", key: null };
 
 function toBase64(bytes) {
-  let s = "";
   const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let s = "";
   for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
   return btoa(s);
 }
@@ -40,15 +42,15 @@ async function sha256Bytes(str) {
 
 async function timingSafeEqualStr(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
-  const ha = await sha256Bytes(a);
-  const hb = await sha256Bytes(b);
+  const [ha, hb] = await Promise.all([sha256Bytes(a), sha256Bytes(b)]);
   let diff = 0;
   for (let i = 0; i < ha.length; i++) diff |= ha[i] ^ hb[i];
   return diff === 0;
 }
 
 function parseCookies(request) {
-  const header = request.headers.get("Cookie") || "";
+  const header = request.headers.get("Cookie");
+  if (!header) return {};
   const map = {};
   for (const part of header.split(";")) {
     const idx = part.indexOf("=");
@@ -95,46 +97,88 @@ function getAuthConfig(env) {
 
 async function getSessionHmacKey(env) {
   const { username, password, encKey } = getAuthConfig(env);
+  const id = `${username.length}:${password.length}:${encKey.length}:${username}`;
+  if (cachedSessionKey.key && cachedSessionKey.id === id) return cachedSessionKey.key;
   const material = await sha256Bytes(`cf-2fa-vault:session:v2:${username}:${password}:${encKey}`);
-  return crypto.subtle.importKey(
+  const key = await crypto.subtle.importKey(
     "raw",
     material,
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign", "verify"]
   );
+  cachedSessionKey = { id, key };
+  return key;
 }
 
 async function getDataAesKey(env) {
   const { password, encKey } = getAuthConfig(env);
   const secretSource = encKey || password;
+  const id = `${secretSource.length}:${secretSource.slice(0, 4)}:${secretSource.slice(-4)}`;
+  if (cachedAesKey.key && cachedAesKey.id === id) return cachedAesKey.key;
   const keyMaterial = await sha256Bytes(`cf-2fa-vault:d1-aes:v2:${secretSource}`);
-  return crypto.subtle.importKey("raw", keyMaterial, { name: "AES-GCM" }, false, [
+  const key = await crypto.subtle.importKey("raw", keyMaterial, { name: "AES-GCM" }, false, [
     "encrypt",
     "decrypt",
   ]);
+  cachedAesKey = { id, key };
+  return key;
 }
 
-async function encryptTokenData(obj, env) {
-  const key = await getDataAesKey(env);
+async function encryptTokenData(obj, aesKey) {
   const iv = new Uint8Array(12);
   crypto.getRandomValues(iv);
   const ct = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
-    key,
+    aesKey,
     enc.encode(JSON.stringify(obj))
   );
   return { iv: toBase64(iv), ciphertext: toBase64(new Uint8Array(ct)) };
 }
 
-async function decryptTokenData(ivB64, ctB64, env) {
-  const key = await getDataAesKey(env);
-  const plain = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: fromBase64(ivB64) },
-    key,
-    fromBase64(ctB64)
-  );
-  return JSON.parse(dec.decode(plain));
+async function decryptTokenRow(row, aesKey) {
+  try {
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: fromBase64(row.iv) },
+      aesKey,
+      fromBase64(row.ciphertext)
+    );
+    const data = JSON.parse(dec.decode(plain));
+    return {
+      id: row.id,
+      pinned: Boolean(row.pinned),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      ...data,
+    };
+  } catch {
+    return {
+      id: row.id,
+      pinned: Boolean(row.pinned),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      issuer: "[解密失败]",
+      account: "ENCRYPTION_KEY 不匹配",
+      secret: "",
+      digits: 6,
+      period: 30,
+      algo: "SHA-1",
+      tag: "",
+      broken: true,
+    };
+  }
+}
+
+async function fetchAllDecryptedTokens(env) {
+  await ensureSchema(env);
+  const [{ results }, aesKey] = await Promise.all([
+    env.DB.prepare(
+      "SELECT id, iv, ciphertext, pinned, created_at, updated_at FROM tokens ORDER BY pinned DESC, updated_at DESC"
+    ).all(),
+    getDataAesKey(env),
+  ]);
+  if (!results || !results.length) return [];
+  return Promise.all(results.map((row) => decryptTokenRow(row, aesKey)));
 }
 
 async function createSessionToken(username, env) {
@@ -153,7 +197,9 @@ async function verifySession(request, env) {
   const cookies = parseCookies(request);
   const raw = cookies[SESSION_COOKIE];
   if (!raw || !raw.includes(".")) return null;
-  const [payloadB64, sigB64] = raw.split(".", 2);
+  const dot = raw.indexOf(".");
+  const payloadB64 = raw.slice(0, dot);
+  const sigB64 = raw.slice(dot + 1);
   if (!payloadB64 || !sigB64) return null;
   try {
     const key = await getSessionHmacKey(env);
@@ -165,8 +211,7 @@ async function verifySession(request, env) {
     );
     if (!ok) return null;
     const payload = JSON.parse(dec.decode(fromBase64Url(payloadB64)));
-    const now = Math.floor(Date.now() / 1000);
-    if (!payload.exp || payload.exp <= now) return null;
+    if (!payload.exp || payload.exp <= Math.floor(Date.now() / 1000)) return null;
     if (!(await timingSafeEqualStr(payload.u, cfg.username))) return null;
     return { username: cfg.username };
   } catch {
@@ -176,16 +221,21 @@ async function verifySession(request, env) {
 
 async function ensureSchema(env) {
   if (schemaReady) return;
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS tokens (
-      id TEXT PRIMARY KEY,
-      iv TEXT NOT NULL,
-      ciphertext TEXT NOT NULL,
-      pinned INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    )`
-  ).run();
+  await env.DB.batch([
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS tokens (
+        id TEXT PRIMARY KEY,
+        iv TEXT NOT NULL,
+        ciphertext TEXT NOT NULL,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )`
+    ),
+    env.DB.prepare(
+      "CREATE INDEX IF NOT EXISTS idx_tokens_order ON tokens(pinned DESC, updated_at DESC)"
+    ),
+  ]);
   schemaReady = true;
 }
 
@@ -213,7 +263,7 @@ export default {
     const { pathname } = url;
     const method = request.method.toUpperCase();
 
-    // Serve self-hosted vendor scripts (zero external CDN, zero build)
+    // Self-hosted lazy-loaded vendor scripts (immutable long cache)
     if (method === "GET" && pathname === "/vendor/jsqr.js") {
       return new Response(JSQR_SRC, {
         status: 200,
@@ -268,7 +318,28 @@ export default {
       }
     }
 
-    // Auth: Login (verified against Worker env vars AUTH_USERNAME & AUTH_PASSWORD)
+    // Single-roundtrip bootstrap: auth check + initial tokens in one HTTP request
+    if (method === "GET" && pathname === "/api/bootstrap") {
+      const cfg = getAuthConfig(env);
+      const user = await verifySession(request, env);
+      if (!user) {
+        return jsonResponse({
+          authenticated: false,
+          authConfigured: cfg.configured,
+          user: null,
+          items: [],
+        });
+      }
+      const items = await fetchAllDecryptedTokens(env);
+      return jsonResponse({
+        authenticated: true,
+        authConfigured: cfg.configured,
+        user,
+        items,
+      });
+    }
+
+    // Auth: Login (returns tokens directly to avoid second round-trip)
     if (method === "POST" && pathname === "/api/auth/login") {
       const cfg = getAuthConfig(env);
       if (!cfg.configured) {
@@ -280,14 +351,19 @@ export default {
       const body = await readJson(request);
       const inputUser = typeof body?.username === "string" ? body.username.trim() : "";
       const inputPass = typeof body?.password === "string" ? body.password : "";
-      const userOk = await timingSafeEqualStr(inputUser, cfg.username);
-      const passOk = await timingSafeEqualStr(inputPass, cfg.password);
+      const [userOk, passOk] = await Promise.all([
+        timingSafeEqualStr(inputUser, cfg.username),
+        timingSafeEqualStr(inputPass, cfg.password),
+      ]);
       if (!userOk || !passOk) {
         return jsonResponse({ error: "用户名或密码错误" }, 401);
       }
-      const token = await createSessionToken(cfg.username, env);
+      const [token, items] = await Promise.all([
+        createSessionToken(cfg.username, env),
+        fetchAllDecryptedTokens(env),
+      ]);
       return jsonResponse(
-        { ok: true, user: { username: cfg.username } },
+        { ok: true, user: { username: cfg.username }, items },
         200,
         { "Set-Cookie": sessionCookieHeader(token, SESSION_TTL_SEC) }
       );
@@ -300,7 +376,7 @@ export default {
       });
     }
 
-    // Auth: Session status
+    // Auth: Session check
     if (method === "GET" && pathname === "/api/auth/me") {
       const cfg = getAuthConfig(env);
       const user = await verifySession(request, env);
@@ -317,45 +393,14 @@ export default {
       if (!user) {
         return jsonResponse({ error: "未登录或会话已过期" }, 401);
       }
-      await ensureSchema(env);
 
-      // List all tokens (decrypted server-side from D1)
       if (method === "GET" && pathname === "/api/tokens") {
-        const { results } = await env.DB.prepare(
-          "SELECT id, iv, ciphertext, pinned, created_at, updated_at FROM tokens ORDER BY pinned DESC, updated_at DESC"
-        ).all();
-        const items = [];
-        for (const row of results || []) {
-          try {
-            const data = await decryptTokenData(row.iv, row.ciphertext, env);
-            items.push({
-              id: row.id,
-              pinned: Boolean(row.pinned),
-              created_at: row.created_at,
-              updated_at: row.updated_at,
-              ...data,
-            });
-          } catch {
-            items.push({
-              id: row.id,
-              pinned: Boolean(row.pinned),
-              created_at: row.created_at,
-              updated_at: row.updated_at,
-              issuer: "[解密失败]",
-              account: "ENCRYPTION_KEY 不匹配",
-              secret: "",
-              digits: 6,
-              period: 30,
-              algo: "SHA-1",
-              tag: "",
-              broken: true,
-            });
-          }
-        }
+        const items = await fetchAllDecryptedTokens(env);
         return jsonResponse({ items });
       }
 
-      // Create single token
+      await ensureSchema(env);
+
       if (method === "POST" && pathname === "/api/tokens") {
         const body = await readJson(request);
         let clean;
@@ -365,7 +410,8 @@ export default {
           return jsonResponse({ error: err.message }, 400);
         }
         const { pinned, ...secretPayload } = clean;
-        const encrypted = await encryptTokenData(secretPayload, env);
+        const aesKey = await getDataAesKey(env);
+        const encrypted = await encryptTokenData(secretPayload, aesKey);
         const id = crypto.randomUUID();
         const now = Math.floor(Date.now() / 1000);
         await env.DB.prepare(
@@ -388,36 +434,37 @@ export default {
         );
       }
 
-      // Batch import tokens
       if (method === "POST" && pathname === "/api/tokens/import") {
         const body = await readJson(request);
         const list = body?.items;
         if (!Array.isArray(list) || list.length === 0 || list.length > 500) {
           return jsonResponse({ error: "请提供 1 到 500 条有效 2FA 记录" }, 400);
         }
-        const now = Math.floor(Date.now() / 1000);
-        const stmts = [];
-        for (const raw of list) {
-          let clean;
-          try {
-            clean = normalizeTokenInput(raw);
-          } catch (err) {
-            return jsonResponse({ error: `导入条目格式错误: ${err.message}` }, 400);
-          }
-          const { pinned, ...secretPayload } = clean;
-          const encrypted = await encryptTokenData(secretPayload, env);
-          stmts.push(
-            env.DB.prepare(
-              `INSERT INTO tokens (id, iv, ciphertext, pinned, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)`
-            ).bind(crypto.randomUUID(), encrypted.iv, encrypted.ciphertext, pinned, now, now)
-          );
+        let cleaned;
+        try {
+          cleaned = list.map(normalizeTokenInput);
+        } catch (err) {
+          return jsonResponse({ error: `导入条目格式错误: ${err.message}` }, 400);
         }
+        const aesKey = await getDataAesKey(env);
+        const now = Math.floor(Date.now() / 1000);
+        const encryptedList = await Promise.all(
+          cleaned.map(async ({ pinned, ...secretPayload }) => ({
+            id: crypto.randomUUID(),
+            pinned,
+            ...(await encryptTokenData(secretPayload, aesKey)),
+          }))
+        );
+        const stmts = encryptedList.map((e) =>
+          env.DB.prepare(
+            `INSERT INTO tokens (id, iv, ciphertext, pinned, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          ).bind(e.id, e.iv, e.ciphertext, e.pinned, now, now)
+        );
         await env.DB.batch(stmts);
         return jsonResponse({ ok: true, imported: stmts.length }, 201);
       }
 
-      // Single item operations: /api/tokens/:id
       const match = pathname.match(/^\/api\/tokens\/([a-zA-Z0-9-]+)$/);
       if (match) {
         const id = match[1];
@@ -426,7 +473,6 @@ export default {
           const body = await readJson(request);
           const now = Math.floor(Date.now() / 1000);
 
-          // Pin-only toggle
           if (body && Object.keys(body).length === 1 && body.pinned !== undefined) {
             const res = await env.DB.prepare(
               "UPDATE tokens SET pinned = ?, updated_at = ? WHERE id = ?"
@@ -444,9 +490,10 @@ export default {
             return jsonResponse({ error: err.message }, 400);
           }
           const { pinned, ...secretPayload } = clean;
-          const encrypted = await encryptTokenData(secretPayload, env);
+          const aesKey = await getDataAesKey(env);
+          const encrypted = await encryptTokenData(secretPayload, aesKey);
           const res = await env.DB.prepare(
-            `UPDATE tokens SET iv = ?, ciphertext = ?, pinned = ?, updated_at = ? WHERE id = ?`
+            "UPDATE tokens SET iv = ?, ciphertext = ?, pinned = ?, updated_at = ? WHERE id = ?"
           )
             .bind(encrypted.iv, encrypted.ciphertext, pinned, now, id)
             .run();
