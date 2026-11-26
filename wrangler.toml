@@ -1,0 +1,11 @@
+name = "cf-2fa-vault"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cf-2fa-vault-db"
+database_id = "ec50001c-77b9-4b97-8bdb-8d7ecc90b41f"
+
+[vars]
+ALLOW_REGISTRATION = "true"
