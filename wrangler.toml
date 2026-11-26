@@ -7,5 +7,7 @@ binding = "DB"
 database_name = "cf-2fa-vault-db"
 database_id = "ec50001c-77b9-4b97-8bdb-8d7ecc90b41f"
 
-[vars]
-ALLOW_REGISTRATION = "true"
+# 在 Cloudflare Dashboard -> Workers & Pages -> cf-2fa-vault -> Settings -> Variables and Secrets 中配置：
+#   AUTH_USERNAME  (必填) 登录用户名，如 admin
+#   AUTH_PASSWORD  (必填) 登录密码（建议使用 Secret 加密存储）
+#   ENCRYPTION_KEY (推荐) 32字节 Base64 密钥，用于 D1 落盘 AES-256-GCM 加密；修改登录密码不影响已有数据

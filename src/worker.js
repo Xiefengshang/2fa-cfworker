@@ -1,10 +1,14 @@
 import { renderHtml } from "./ui.js";
+import { JSQR_SRC } from "./vendor/jsqr.js";
+import { QRCODE_SRC } from "./vendor/qrcode.js";
 
-const SESSION_COOKIE = "vault_sid";
+const SESSION_COOKIE = "vault_session";
 const SESSION_TTL_SEC = 60 * 60 * 24 * 7; // 7 days
-const SERVER_PBKDF2_ITERATIONS = 100000;
 
 const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+let schemaReady = false;
 
 function toBase64(bytes) {
   let s = "";
@@ -20,46 +24,26 @@ function fromBase64(b64) {
   return out;
 }
 
-function randomBase64(len = 24) {
-  const buf = new Uint8Array(len);
-  crypto.getRandomValues(buf);
-  return toBase64(buf);
+function toBase64Url(bytes) {
+  return toBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-async function sha256Base64(str) {
-  const digest = await crypto.subtle.digest("SHA-256", enc.encode(str));
-  return toBase64(new Uint8Array(digest));
+function fromBase64Url(str) {
+  let s = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return fromBase64(s);
 }
 
-async function hashAuthToken(authHashB64, saltB64) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(authHashB64),
-    "PBKDF2",
-    false,
-    ["deriveBits"]
-  );
-  const bits = await crypto.subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      hash: "SHA-256",
-      salt: fromBase64(saltB64),
-      iterations: SERVER_PBKDF2_ITERATIONS,
-    },
-    key,
-    256
-  );
-  return toBase64(new Uint8Array(bits));
+async function sha256Bytes(str) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(str)));
 }
 
-function timingSafeEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) {
-    return false;
-  }
+async function timingSafeEqualStr(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const ha = await sha256Bytes(a);
+  const hb = await sha256Bytes(b);
   let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
+  for (let i = 0; i < ha.length; i++) diff |= ha[i] ^ hb[i];
   return diff === 0;
 }
 
@@ -75,11 +59,9 @@ function parseCookies(request) {
   return map;
 }
 
-function sessionCookieHeader(token, maxAge) {
-  const base = `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Strict`;
-  return maxAge === 0
-    ? `${base}; Max-Age=0`
-    : `${base}; Max-Age=${maxAge}`;
+function sessionCookieHeader(value, maxAge) {
+  const base = `${SESSION_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Strict`;
+  return maxAge === 0 ? `${base}; Max-Age=0` : `${base}; Max-Age=${maxAge}`;
 }
 
 function jsonResponse(data, status = 200, extraHeaders = {}) {
@@ -104,47 +86,125 @@ async function readJson(request) {
   }
 }
 
-async function getSessionUser(request, env) {
-  const cookies = parseCookies(request);
-  const sid = cookies[SESSION_COOKIE];
-  if (!sid) return null;
-  const tokenHash = await sha256Base64(sid);
-  const now = Math.floor(Date.now() / 1000);
-  const row = await env.DB.prepare(
-    `SELECT u.id, u.username, u.kdf_salt, u.kdf_iterations, s.expires_at
-     FROM sessions s
-     JOIN users u ON u.id = s.user_id
-     WHERE s.token_hash = ? AND s.expires_at > ?`
-  )
-    .bind(tokenHash, now)
-    .first();
-  if (!row) return null;
-  return {
-    id: row.id,
-    username: row.username,
-    kdfSalt: row.kdf_salt,
-    kdfIterations: row.kdf_iterations,
-    tokenHash,
-  };
+function getAuthConfig(env) {
+  const username = typeof env.AUTH_USERNAME === "string" ? env.AUTH_USERNAME.trim() : "";
+  const password = typeof env.AUTH_PASSWORD === "string" ? env.AUTH_PASSWORD : "";
+  const encKey = typeof env.ENCRYPTION_KEY === "string" ? env.ENCRYPTION_KEY.trim() : "";
+  return { username, password, encKey, configured: Boolean(username && password) };
 }
 
-async function createSession(userId, env) {
-  const sid = randomBase64(32);
-  const tokenHash = await sha256Base64(sid);
-  const now = Math.floor(Date.now() / 1000);
-  const expiresAt = now + SESSION_TTL_SEC;
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(now),
-    env.DB.prepare(
-      "INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)"
-    ).bind(tokenHash, userId, expiresAt, now),
+async function getSessionHmacKey(env) {
+  const { username, password, encKey } = getAuthConfig(env);
+  const material = await sha256Bytes(`cf-2fa-vault:session:v2:${username}:${password}:${encKey}`);
+  return crypto.subtle.importKey(
+    "raw",
+    material,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+}
+
+async function getDataAesKey(env) {
+  const { password, encKey } = getAuthConfig(env);
+  const secretSource = encKey || password;
+  const keyMaterial = await sha256Bytes(`cf-2fa-vault:d1-aes:v2:${secretSource}`);
+  return crypto.subtle.importKey("raw", keyMaterial, { name: "AES-GCM" }, false, [
+    "encrypt",
+    "decrypt",
   ]);
-  return sid;
 }
 
-function normalizeUsername(u) {
-  if (typeof u !== "string") return "";
-  return u.trim().toLowerCase();
+async function encryptTokenData(obj, env) {
+  const key = await getDataAesKey(env);
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    enc.encode(JSON.stringify(obj))
+  );
+  return { iv: toBase64(iv), ciphertext: toBase64(new Uint8Array(ct)) };
+}
+
+async function decryptTokenData(ivB64, ctB64, env) {
+  const key = await getDataAesKey(env);
+  const plain = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: fromBase64(ivB64) },
+    key,
+    fromBase64(ctB64)
+  );
+  return JSON.parse(dec.decode(plain));
+}
+
+async function createSessionToken(username, env) {
+  const now = Math.floor(Date.now() / 1000);
+  const payload = toBase64Url(
+    enc.encode(JSON.stringify({ u: username, iat: now, exp: now + SESSION_TTL_SEC }))
+  );
+  const key = await getSessionHmacKey(env);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(payload)));
+  return `${payload}.${toBase64Url(sig)}`;
+}
+
+async function verifySession(request, env) {
+  const cfg = getAuthConfig(env);
+  if (!cfg.configured) return null;
+  const cookies = parseCookies(request);
+  const raw = cookies[SESSION_COOKIE];
+  if (!raw || !raw.includes(".")) return null;
+  const [payloadB64, sigB64] = raw.split(".", 2);
+  if (!payloadB64 || !sigB64) return null;
+  try {
+    const key = await getSessionHmacKey(env);
+    const ok = await crypto.subtle.verify(
+      "HMAC",
+      key,
+      fromBase64Url(sigB64),
+      enc.encode(payloadB64)
+    );
+    if (!ok) return null;
+    const payload = JSON.parse(dec.decode(fromBase64Url(payloadB64)));
+    const now = Math.floor(Date.now() / 1000);
+    if (!payload.exp || payload.exp <= now) return null;
+    if (!(await timingSafeEqualStr(payload.u, cfg.username))) return null;
+    return { username: cfg.username };
+  } catch {
+    return null;
+  }
+}
+
+async function ensureSchema(env) {
+  if (schemaReady) return;
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS tokens (
+      id TEXT PRIMARY KEY,
+      iv TEXT NOT NULL,
+      ciphertext TEXT NOT NULL,
+      pinned INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`
+  ).run();
+  schemaReady = true;
+}
+
+function normalizeTokenInput(body) {
+  const issuer = String(body?.issuer || "").trim().slice(0, 120);
+  const account = String(body?.account || "").trim().slice(0, 160);
+  const secret = String(body?.secret || "")
+    .toUpperCase()
+    .replace(/[^A-Z2-7]/g, "");
+  if (!issuer) throw new Error("服务商 (Issuer) 不能为空");
+  if (!secret || secret.length < 8) throw new Error("Base32 密钥无效（至少 8 位有效 Base32 字符）");
+  const digits = Number(body?.digits) === 8 ? 8 : 6;
+  const periodNum = Number(body?.period || 30);
+  const period = Number.isFinite(periodNum) ? Math.max(10, Math.min(120, Math.round(periodNum))) : 30;
+  const rawAlgo = String(body?.algo || "SHA-1").toUpperCase().replace("-", "");
+  const algo = rawAlgo === "SHA256" ? "SHA-256" : rawAlgo === "SHA512" ? "SHA-512" : "SHA-1";
+  const tag = String(body?.tag || "").trim().slice(0, 40);
+  const pinned = body?.pinned ? 1 : 0;
+  return { issuer, account, secret, digits, period, algo, tag, pinned };
 }
 
 export default {
@@ -152,6 +212,28 @@ export default {
     const url = new URL(request.url);
     const { pathname } = url;
     const method = request.method.toUpperCase();
+
+    // Serve self-hosted vendor scripts (zero external CDN, zero build)
+    if (method === "GET" && pathname === "/vendor/jsqr.js") {
+      return new Response(JSQR_SRC, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/javascript; charset=utf-8",
+          "Cache-Control": "public, max-age=31536000, immutable",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    }
+    if (method === "GET" && pathname === "/vendor/qrcode.js") {
+      return new Response(QRCODE_SRC, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/javascript; charset=utf-8",
+          "Cache-Control": "public, max-age=31536000, immutable",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    }
 
     // Serve SPA Frontend
     if (method === "GET" && (pathname === "/" || pathname === "/index.html")) {
@@ -164,300 +246,220 @@ export default {
           "X-Frame-Options": "DENY",
           "Referrer-Policy": "no-referrer",
           "Content-Security-Policy":
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
         },
       });
     }
 
     // Health check
     if (method === "GET" && pathname === "/api/health") {
+      const cfg = getAuthConfig(env);
       try {
+        await ensureSchema(env);
         const res = await env.DB.prepare("SELECT 1 AS ok").first();
-        return jsonResponse({ ok: true, db: res?.ok === 1, runtime: "cloudflare-workers" });
-      } catch (e) {
-        return jsonResponse({ ok: false, error: "Database unavailable" }, 500);
-      }
-    }
-
-    // Auth: KDF params lookup (uses deterministic fallback salt to avoid user enumeration)
-    if (method === "POST" && pathname === "/api/auth/params") {
-      const body = await readJson(request);
-      const username = normalizeUsername(body?.username);
-      if (!username || username.length < 2 || username.length > 64) {
-        return jsonResponse({ error: "Invalid username" }, 400);
-      }
-      const user = await env.DB.prepare(
-        "SELECT kdf_salt, kdf_iterations FROM users WHERE username = ?"
-      )
-        .bind(username)
-        .first();
-      if (user) {
         return jsonResponse({
-          kdfSalt: user.kdf_salt,
-          kdfIterations: user.kdf_iterations,
+          ok: true,
+          db: res?.ok === 1,
+          authConfigured: cfg.configured,
+          runtime: "cloudflare-workers",
         });
+      } catch {
+        return jsonResponse({ ok: false, db: false, authConfigured: cfg.configured }, 500);
       }
-      const fakeSalt = (await sha256Base64("cf-2fa-vault-fake-salt:" + username)).slice(0, 24);
-      return jsonResponse({ kdfSalt: fakeSalt, kdfIterations: 200000 });
     }
 
-    // Auth: Register
-    if (method === "POST" && pathname === "/api/auth/register") {
-      if (env.ALLOW_REGISTRATION === "false") {
-        return jsonResponse({ error: "Registration is disabled" }, 403);
-      }
-      const body = await readJson(request);
-      const username = normalizeUsername(body?.username);
-      const authHash = body?.authHash;
-      const kdfSalt = body?.kdfSalt;
-      const kdfIterations = Number(body?.kdfIterations || 200000);
-
-      if (!/^[a-z0-9._-]{2,48}$/.test(username)) {
+    // Auth: Login (verified against Worker env vars AUTH_USERNAME & AUTH_PASSWORD)
+    if (method === "POST" && pathname === "/api/auth/login") {
+      const cfg = getAuthConfig(env);
+      if (!cfg.configured) {
         return jsonResponse(
-          { error: "Username must be 2-48 chars (letters, numbers, . _ -)" },
-          400
+          { error: "服务端未配置 AUTH_USERNAME / AUTH_PASSWORD 环境变量" },
+          503
         );
       }
-      if (typeof authHash !== "string" || authHash.length < 32 || authHash.length > 128) {
-        return jsonResponse({ error: "Invalid authHash" }, 400);
-      }
-      if (typeof kdfSalt !== "string" || kdfSalt.length < 16 || kdfSalt.length > 64) {
-        return jsonResponse({ error: "Invalid kdfSalt" }, 400);
-      }
-      if (!Number.isInteger(kdfIterations) || kdfIterations < 100000 || kdfIterations > 600000) {
-        return jsonResponse({ error: "Invalid kdfIterations" }, 400);
-      }
-
-      const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ?")
-        .bind(username)
-        .first();
-      if (existing) {
-        return jsonResponse({ error: "Username already exists" }, 409);
-      }
-
-      const userId = crypto.randomUUID();
-      const authSalt = randomBase64(16);
-      const storedHash = await hashAuthToken(authHash, authSalt);
-      const now = Math.floor(Date.now() / 1000);
-
-      await env.DB.prepare(
-        `INSERT INTO users (id, username, auth_salt, auth_hash, kdf_salt, kdf_iterations, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(userId, username, authSalt, storedHash, kdfSalt, kdfIterations, now)
-        .run();
-
-      const sid = await createSession(userId, env);
-      return jsonResponse(
-        {
-          ok: true,
-          user: { id: userId, username, kdfSalt, kdfIterations },
-        },
-        201,
-        { "Set-Cookie": sessionCookieHeader(sid, SESSION_TTL_SEC) }
-      );
-    }
-
-    // Auth: Login
-    if (method === "POST" && pathname === "/api/auth/login") {
       const body = await readJson(request);
-      const username = normalizeUsername(body?.username);
-      const authHash = body?.authHash;
-      if (!username || typeof authHash !== "string") {
-        return jsonResponse({ error: "Invalid credentials" }, 400);
+      const inputUser = typeof body?.username === "string" ? body.username.trim() : "";
+      const inputPass = typeof body?.password === "string" ? body.password : "";
+      const userOk = await timingSafeEqualStr(inputUser, cfg.username);
+      const passOk = await timingSafeEqualStr(inputPass, cfg.password);
+      if (!userOk || !passOk) {
+        return jsonResponse({ error: "用户名或密码错误" }, 401);
       }
-      const user = await env.DB.prepare(
-        "SELECT id, username, auth_salt, auth_hash, kdf_salt, kdf_iterations FROM users WHERE username = ?"
-      )
-        .bind(username)
-        .first();
-      if (!user) {
-        return jsonResponse({ error: "Invalid username or master password" }, 401);
-      }
-      const computed = await hashAuthToken(authHash, user.auth_salt);
-      if (!timingSafeEqual(computed, user.auth_hash)) {
-        return jsonResponse({ error: "Invalid username or master password" }, 401);
-      }
-      const sid = await createSession(user.id, env);
+      const token = await createSessionToken(cfg.username, env);
       return jsonResponse(
-        {
-          ok: true,
-          user: {
-            id: user.id,
-            username: user.username,
-            kdfSalt: user.kdf_salt,
-            kdfIterations: user.kdf_iterations,
-          },
-        },
+        { ok: true, user: { username: cfg.username } },
         200,
-        { "Set-Cookie": sessionCookieHeader(sid, SESSION_TTL_SEC) }
+        { "Set-Cookie": sessionCookieHeader(token, SESSION_TTL_SEC) }
       );
     }
 
     // Auth: Logout
     if (method === "POST" && pathname === "/api/auth/logout") {
-      const user = await getSessionUser(request, env);
-      if (user) {
-        await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?")
-          .bind(user.tokenHash)
-          .run();
-      }
       return jsonResponse({ ok: true }, 200, {
         "Set-Cookie": sessionCookieHeader("", 0),
       });
     }
 
-    // Auth: Current session
+    // Auth: Session status
     if (method === "GET" && pathname === "/api/auth/me") {
-      const user = await getSessionUser(request, env);
-      if (!user) {
-        return jsonResponse({ authenticated: false });
-      }
+      const cfg = getAuthConfig(env);
+      const user = await verifySession(request, env);
       return jsonResponse({
-        authenticated: true,
-        user: {
-          id: user.id,
-          username: user.username,
-          kdfSalt: user.kdfSalt,
-          kdfIterations: user.kdfIterations,
-        },
+        authenticated: Boolean(user),
+        authConfigured: cfg.configured,
+        user: user || null,
       });
     }
 
-    // All /api/vault* routes require authentication
-    if (pathname.startsWith("/api/vault")) {
-      const user = await getSessionUser(request, env);
+    // Protected API: /api/tokens*
+    if (pathname.startsWith("/api/tokens")) {
+      const user = await verifySession(request, env);
       if (!user) {
-        return jsonResponse({ error: "Unauthorized" }, 401);
+        return jsonResponse({ error: "未登录或会话已过期" }, 401);
       }
+      await ensureSchema(env);
 
-      // List vault items
-      if (method === "GET" && pathname === "/api/vault") {
+      // List all tokens (decrypted server-side from D1)
+      if (method === "GET" && pathname === "/api/tokens") {
         const { results } = await env.DB.prepare(
-          `SELECT id, iv, ciphertext, pinned, created_at, updated_at
-           FROM vault_items
-           WHERE user_id = ?
-           ORDER BY pinned DESC, updated_at DESC`
-        )
-          .bind(user.id)
-          .all();
-        return jsonResponse({ items: results || [] });
+          "SELECT id, iv, ciphertext, pinned, created_at, updated_at FROM tokens ORDER BY pinned DESC, updated_at DESC"
+        ).all();
+        const items = [];
+        for (const row of results || []) {
+          try {
+            const data = await decryptTokenData(row.iv, row.ciphertext, env);
+            items.push({
+              id: row.id,
+              pinned: Boolean(row.pinned),
+              created_at: row.created_at,
+              updated_at: row.updated_at,
+              ...data,
+            });
+          } catch {
+            items.push({
+              id: row.id,
+              pinned: Boolean(row.pinned),
+              created_at: row.created_at,
+              updated_at: row.updated_at,
+              issuer: "[解密失败]",
+              account: "ENCRYPTION_KEY 不匹配",
+              secret: "",
+              digits: 6,
+              period: 30,
+              algo: "SHA-1",
+              tag: "",
+              broken: true,
+            });
+          }
+        }
+        return jsonResponse({ items });
       }
 
-      // Create vault item
-      if (method === "POST" && pathname === "/api/vault") {
+      // Create single token
+      if (method === "POST" && pathname === "/api/tokens") {
         const body = await readJson(request);
-        const { iv, ciphertext, pinned } = body || {};
-        if (
-          typeof iv !== "string" ||
-          typeof ciphertext !== "string" ||
-          iv.length < 12 ||
-          iv.length > 64 ||
-          ciphertext.length < 16 ||
-          ciphertext.length > 16384
-        ) {
-          return jsonResponse({ error: "Invalid encrypted payload" }, 400);
+        let clean;
+        try {
+          clean = normalizeTokenInput(body);
+        } catch (err) {
+          return jsonResponse({ error: err.message }, 400);
         }
+        const { pinned, ...secretPayload } = clean;
+        const encrypted = await encryptTokenData(secretPayload, env);
         const id = crypto.randomUUID();
         const now = Math.floor(Date.now() / 1000);
-        const pinVal = pinned ? 1 : 0;
         await env.DB.prepare(
-          `INSERT INTO vault_items (id, user_id, iv, ciphertext, pinned, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO tokens (id, iv, ciphertext, pinned, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`
         )
-          .bind(id, user.id, iv, ciphertext, pinVal, now, now)
+          .bind(id, encrypted.iv, encrypted.ciphertext, pinned, now, now)
           .run();
         return jsonResponse(
           {
-            item: { id, iv, ciphertext, pinned: pinVal, created_at: now, updated_at: now },
+            item: {
+              id,
+              pinned: Boolean(pinned),
+              created_at: now,
+              updated_at: now,
+              ...secretPayload,
+            },
           },
           201
         );
       }
 
-      // Batch import encrypted items
-      if (method === "POST" && pathname === "/api/vault/import") {
+      // Batch import tokens
+      if (method === "POST" && pathname === "/api/tokens/import") {
         const body = await readJson(request);
-        const items = body?.items;
-        if (!Array.isArray(items) || items.length === 0 || items.length > 500) {
-          return jsonResponse({ error: "Provide 1 to 500 encrypted items" }, 400);
+        const list = body?.items;
+        if (!Array.isArray(list) || list.length === 0 || list.length > 500) {
+          return jsonResponse({ error: "请提供 1 到 500 条有效 2FA 记录" }, 400);
         }
         const now = Math.floor(Date.now() / 1000);
         const stmts = [];
-        for (const it of items) {
-          if (
-            typeof it?.iv !== "string" ||
-            typeof it?.ciphertext !== "string" ||
-            it.iv.length < 12 ||
-            it.iv.length > 64 ||
-            it.ciphertext.length < 16 ||
-            it.ciphertext.length > 16384
-          ) {
-            return jsonResponse({ error: "Malformed item in batch" }, 400);
+        for (const raw of list) {
+          let clean;
+          try {
+            clean = normalizeTokenInput(raw);
+          } catch (err) {
+            return jsonResponse({ error: `导入条目格式错误: ${err.message}` }, 400);
           }
+          const { pinned, ...secretPayload } = clean;
+          const encrypted = await encryptTokenData(secretPayload, env);
           stmts.push(
             env.DB.prepare(
-              `INSERT INTO vault_items (id, user_id, iv, ciphertext, pinned, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)`
-            ).bind(crypto.randomUUID(), user.id, it.iv, it.ciphertext, it.pinned ? 1 : 0, now, now)
+              `INSERT INTO tokens (id, iv, ciphertext, pinned, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)`
+            ).bind(crypto.randomUUID(), encrypted.iv, encrypted.ciphertext, pinned, now, now)
           );
         }
         await env.DB.batch(stmts);
         return jsonResponse({ ok: true, imported: stmts.length }, 201);
       }
 
-      // Single item routes: /api/vault/:id
-      const match = pathname.match(/^\/api\/vault\/([a-zA-Z0-9-]+)$/);
+      // Single item operations: /api/tokens/:id
+      const match = pathname.match(/^\/api\/tokens\/([a-zA-Z0-9-]+)$/);
       if (match) {
-        const itemId = match[1];
+        const id = match[1];
 
         if (method === "PUT") {
           const body = await readJson(request);
-          const { iv, ciphertext, pinned } = body || {};
           const now = Math.floor(Date.now() / 1000);
 
-          if (iv !== undefined && ciphertext !== undefined) {
-            if (
-              typeof iv !== "string" ||
-              typeof ciphertext !== "string" ||
-              iv.length < 12 ||
-              iv.length > 64 ||
-              ciphertext.length < 16 ||
-              ciphertext.length > 16384
-            ) {
-              return jsonResponse({ error: "Invalid encrypted payload" }, 400);
-            }
+          // Pin-only toggle
+          if (body && Object.keys(body).length === 1 && body.pinned !== undefined) {
             const res = await env.DB.prepare(
-              `UPDATE vault_items
-               SET iv = ?, ciphertext = ?, pinned = COALESCE(?, pinned), updated_at = ?
-               WHERE id = ? AND user_id = ?`
+              "UPDATE tokens SET pinned = ?, updated_at = ? WHERE id = ?"
             )
-              .bind(iv, ciphertext, pinned === undefined ? null : pinned ? 1 : 0, now, itemId, user.id)
+              .bind(body.pinned ? 1 : 0, now, id)
               .run();
-            if (!res.meta?.changes) return jsonResponse({ error: "Not found" }, 404);
+            if (!res.meta?.changes) return jsonResponse({ error: "条目不存在" }, 404);
             return jsonResponse({ ok: true, updated_at: now });
           }
 
-          if (pinned !== undefined) {
-            const res = await env.DB.prepare(
-              `UPDATE vault_items SET pinned = ?, updated_at = ? WHERE id = ? AND user_id = ?`
-            )
-              .bind(pinned ? 1 : 0, now, itemId, user.id)
-              .run();
-            if (!res.meta?.changes) return jsonResponse({ error: "Not found" }, 404);
-            return jsonResponse({ ok: true, updated_at: now });
+          let clean;
+          try {
+            clean = normalizeTokenInput(body);
+          } catch (err) {
+            return jsonResponse({ error: err.message }, 400);
           }
-
-          return jsonResponse({ error: "Nothing to update" }, 400);
+          const { pinned, ...secretPayload } = clean;
+          const encrypted = await encryptTokenData(secretPayload, env);
+          const res = await env.DB.prepare(
+            `UPDATE tokens SET iv = ?, ciphertext = ?, pinned = ?, updated_at = ? WHERE id = ?`
+          )
+            .bind(encrypted.iv, encrypted.ciphertext, pinned, now, id)
+            .run();
+          if (!res.meta?.changes) return jsonResponse({ error: "条目不存在" }, 404);
+          return jsonResponse({
+            ok: true,
+            item: { id, pinned: Boolean(pinned), updated_at: now, ...secretPayload },
+          });
         }
 
         if (method === "DELETE") {
-          const res = await env.DB.prepare(
-            "DELETE FROM vault_items WHERE id = ? AND user_id = ?"
-          )
-            .bind(itemId, user.id)
-            .run();
-          if (!res.meta?.changes) return jsonResponse({ error: "Not found" }, 404);
+          const res = await env.DB.prepare("DELETE FROM tokens WHERE id = ?").bind(id).run();
+          if (!res.meta?.changes) return jsonResponse({ error: "条目不存在" }, 404);
           return jsonResponse({ ok: true });
         }
       }
