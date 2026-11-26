@@ -106,11 +106,17 @@ function jsonResponse(data, status = 200, extraHeaders = {}) {
 }
 
 function staticResponse(body, contentType, immutable = true, extraHeaders = {}) {
+  const cacheHeaders = immutable
+    ? { "Cache-Control": "public, max-age=31536000, immutable" }
+    : {
+        "Cache-Control": "private, no-store, no-cache, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+      };
   return new Response(body, {
     status: 200,
     headers: {
       "Content-Type": contentType,
-      "Cache-Control": immutable ? "public, max-age=31536000, immutable" : "no-cache",
+      ...cacheHeaders,
       ...BASE_SEC_HEADERS,
       ...extraHeaders,
     },
@@ -173,11 +179,57 @@ function sessionCookieHeader(token, maxAge, https) {
   return maxAge === 0 ? `${base}; Max-Age=0` : `${base}; Max-Age=${maxAge}`;
 }
 
-function verifyCsrf(request, url) {
+function isOriginAllowed(originHeader, rawAllowed) {
+  if (typeof rawAllowed !== "string" || !rawAllowed.trim()) return false;
+  let parsed;
+  try {
+    parsed = new URL(originHeader);
+  } catch {
+    return false;
+  }
+  const origProto = parsed.protocol.toLowerCase();
+  const origHost = parsed.hostname.toLowerCase();
+  const origHostPort = parsed.host.toLowerCase();
+  const origFull = parsed.origin.toLowerCase();
+
+  const rules = rawAllowed
+    .split(/[,;\s]+/)
+    .map((s) => s.trim().toLowerCase().replace(/\/+$/, ""))
+    .filter(Boolean);
+
+  for (const rule of rules) {
+    if (rule === "*") return true;
+    if (rule.startsWith("https://") || rule.startsWith("http://")) {
+      if (origFull === rule) return true;
+      continue;
+    }
+    if (rule.startsWith("*.")) {
+      const base = rule.slice(2);
+      if (
+        base.includes(".") &&
+        origProto === "https:" &&
+        (origHost === base || origHost.endsWith("." + base))
+      ) {
+        return true;
+      }
+      continue;
+    }
+    const isLocal = origHost === "localhost" || origHost === "127.0.0.1";
+    if ((origProto === "https:" || isLocal) && (origHost === rule || origHostPort === rule)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function verifyCsrf(request, url, env) {
   // Require custom header X-Vault-Client: 1 on all state-changing API calls
   if (request.headers.get("X-Vault-Client") !== "1") return false;
   const origin = request.headers.get("Origin");
-  if (origin && origin !== url.origin) return false;
+  const allowedCfg = env.ALLOWED_ORIGINS || env.ALLOWED_DOMAINS || "";
+  if (origin && origin !== url.origin && !isOriginAllowed(origin, allowedCfg)) {
+    return false;
+  }
   const fetchSite = request.headers.get("Sec-Fetch-Site");
   if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") return false;
   return true;
@@ -471,7 +523,7 @@ export default {
 
     // Enforce CSRF check on all state-changing API calls
     if (pathname.startsWith("/api/") && (method === "POST" || method === "PUT" || method === "DELETE")) {
-      if (!verifyCsrf(request, url)) {
+      if (!verifyCsrf(request, url, env)) {
         return jsonResponse({ error: "非法跨站请求已拦截 (CSRF)" }, 403);
       }
     }

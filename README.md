@@ -133,8 +133,11 @@ flowchart LR
 | `AUTH_USERNAME` | Secret | 是 | 登录用户名（如 `admin`） |
 | `AUTH_PASSWORD` | Secret | 是 | 登录密码（建议使用高强度密码；修改密码后所有已登录设备会立即自动登出） |
 | `ENCRYPTION_KEY` | Secret | 推荐 | 任意高熵随机字符串（如 32 字节 Base64），用于派生 D1 数据库存储密钥。单独配置后，日后修改 `AUTH_PASSWORD` 不会影响已存储的 2FA 数据 |
+| `ALLOWED_ORIGINS` | Text / Secret | 选填 | 当通过 **EdgeOne / 其他 CDN CNAME 反代回源**（回源改写了 `Host` 头）时填写你的访问域名。支持裸域名、泛域名或完整 Origin，多个用逗号分隔，例如：`2fa.example.com, *.example.org` |
 
-> **国内网络访问提示**：由于 `*.workers.dev` 默认域名在国内存在 SNI 阻断，建议在 Worker 的 **Settings → Domains & Routes** 中绑定一个托管在 Cloudflare 上的自定义域名以获得最佳直连速度。
+> **国内网络访问与 EdgeOne / CDN 反代提示**：
+> - 方式一：在 Cloudflare Worker 的 **Settings → Domains & Routes** 直接绑定托管在 Cloudflare 的自定义域名（无需配置 `ALLOWED_ORIGINS`）。
+> - 方式二：使用腾讯云 EdgeOne / 阿里云 ESA 等国内 CDN CNAME 到 `*.workers.dev` 并改写回源 Host 时，只需在 Worker 变量中添加 `ALLOWED_ORIGINS` 填入你的前端域名（如 `2fa.yourdomain.com` 或 `*.yourdomain.com`）。静态资源（`/app.css`、`/app.js` 等）会自动被 CDN 边缘强缓存加速，而 HTML 与 `/api/*` 自动带 `CDN-Cache-Control: no-store` 绝不误缓存隐私数据。
 
 ---
 
