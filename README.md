@@ -1,6 +1,6 @@
 # 2FA Vault (`2fa-cfworker`)
 
-基于 **Cloudflare Workers + Cloudflare D1** 的全 Serverless 在线 2FA (TOTP) 密钥库。**零本地编译、零 npm 依赖、零前端框架**，代码提交至 GitHub 即可由云端自动发布。
+基于 **Cloudflare Workers + Cloudflare D1** 的**端到端零知识加密（E2EE）**全 Serverless 在线 2FA (TOTP) 密钥库。**零本地编译、零 npm 依赖、零前端框架**，代码推送至 GitHub 即由云端自动完成语法校验与边缘发布。
 
 ---
 
@@ -18,29 +18,21 @@
 
 ## 核心特性
 
-### 1. 现代克制的交互体验
-- **双主题自适应**：首屏无闪烁跟随系统浅色/深色模式，支持一键手动切换并持久化偏好。
-- **双视图与多维筛选**：支持**卡片网格**与**紧凑列表**切换、分类标签横向滚动筛选、排序切换（置顶优先 / 名称 A-Z / 最近更新）以及实时搜索（快捷键 `/` 或 `Ctrl+K`）。
-- **直觉化操作**：点击验证码区域直接复制并反馈状态；倒计时剩余 ≤ 5 秒时自动切换琥珀色提醒并提前展示**下一组验证码**；支持添加到手机/桌面主屏幕（PWA）。
-- **全尺寸端适配**：桌面端高效多列排布；手机端自动切换为底部抽屉式弹窗（Bottom Sheet）、安全区内边距适配、16px 输入字号（防止 iOS Safari 点击输入框自动放大页面），在 320px 小屏至桌面宽屏下均无横向溢出。
+### 1. 真正的端到端零知识加密（Zero-Knowledge E2EE `v4`）
+- **服务端与 CDN 零明文接触**：所有 2FA 令牌（含服务商、账号、Base32 种子、标签）均在**浏览器本地**经 **PBKDF2-SHA256（600,000 次迭代 + 32 字节随机盐）** 派生不可导出的 `AES-256-GCM` 密钥加密后才上传至 Cloudflare D1，并将记录 UUID 作为 **AAD（附加认证数据）** 绑定防跨行替换。端到端主密码永远不离开浏览器。
+- **运行时内存零裸密钥驻留**：解锁后前端立即将 Base32 种子导入为 `extractable: false` 的 Web Crypto `HMAC CryptoKey` 并擦除字节数组，运行时状态与缓存键中不保留任何明文种子；仅在导出二维码、编辑查看或导出备份时按需瞬态解密。
+- **无缝旧版迁移与在线主密码轮换**：若检测到库内存在旧版 `v3` 服务端加密记录，首次设置端到端主密码时自动在浏览器端全量重加密升级为 `v4` 密文；支持随时在「安全设置」中在线更换端到端主密码并原子重加密全库。
+- **受信任设备免重复输入与一键锁定**：可选开启受信任设备解锁记忆（使用 IndexedDB 存储 `extractable: false` 的原生 `CryptoKey` 对象，无法导出原始密钥字节），顶栏提供一键「锁定」与「吊销其他全部登录设备」。
 
-### 2. 极速响应与低配设备友好
-- **极小首屏与长期缓存**：HTML 外壳 gzip 仅 **~4.3 KB**，样式 `/app.css`（~4.9 KB gzip）与逻辑 `/app.js`（~13.7 KB gzip）均带内容哈希版本号并启用 `immutable` 一年强缓存；二维码识别与生成组件（`jsqr.js` / `qrcode.js`）仅在点击扫码或导出二维码时**按需懒加载**。
-- **单次往返加载**：`/api/bootstrap` 在单次 HTTP 请求与单次 `D1.batch` 中同时完成会话校验与全部密文读取，Worker 使用 `Promise.all` 并发解密并复用 Isolate 内存中的派生密钥。
-- **极低 CPU/GPU 占用**：
-  - 彻底移除高开销的 `backdrop-filter` 毛玻璃模糊，卡片启用 `content-visibility: auto`。
-  - 浏览器端缓存每个令牌的 Web Crypto `HMAC CryptoKey`，仅在 30 秒周期跨步时计算一次验证码，其余每秒仅更新文本与轻量 SVG 宽度属性；标签页切入后台时自动暂停定时器。
-  - 服务端返回边缘节点标准时间，自动检测并补偿本机时钟偏差（≥ 15 秒时自动对齐）。
+### 2. 真 PWA 离线可用与极速响应
+- **断网 / 飞行模式完整可用**：内置原生 Service Worker (`/sw.js`) 缓存应用外壳与静态资源，并在本地保存纯 `v4` 密文快照；无网络或飞行模式下打开应用仍可通过主密码本地解密并正常计算动态口令，恢复联网后自动同步。
+- **路径级内容哈希强缓存**：所有静态资源（`/assets/<hash>/app.css`、`/assets/<hash>/app.js`、`jsqr.js`、`qrcode.js`、`icon.svg`）均将 SHA-256 内容哈希嵌入 URL 路径而非 `?v=` 查询参数，彻底规避国内 CDN「忽略参数缓存」导致的旧版本残留问题。
+- **极低 CPU/GPU 占用与 RTT 时钟补偿**：每秒仅更新倒计时文本与轻量 SVG 宽度属性，跨周期时计算一次 HMAC；基于请求往返中点（`RTT / 2`）自动检测并补偿本机时钟偏差。
 
-### 3. 全格式扫码、传图与迁移备份
-- **零外网 CDN 依赖**：内置自托管 `/vendor/jsqr.js` 与 `/vendor/qrcode.js`，国内网络环境无需访问外部公共 CDN。
-- **多种录入方式**：
-  - **摄像头实时扫码**（自动节流至 ~8 fps，兼顾识别速度与低配手机发热控制）
-  - **二维码图片识别**（支持文件选择、拖拽放入、以及弹窗内直接 `Ctrl+V` 粘贴截图）
-  - **链接直接解析**：支持标准 `otpauth://totp/...` 与 **Google Authenticator 批量迁移二维码** (`otpauth-migration://offline?data=...` Protobuf 协议)
-- **多格式导入与智能去重**：
-  - 原生支持导入本应用 `.json` 备份、第三方 `{ accounts, groups }` 结构 JSON 备份、以及多行 `otpauth://` `.txt` 列表，默认开启指纹自动去重。
-  - 支持单个令牌生成可扫描的 SVG 二维码，方便反向迁移回任意手机验证器 App。
+### 3. 全格式扫码、严谨校验与加密备份
+- **零外网 CDN 依赖**：自托管按需懒加载二维码识别与生成组件，支持摄像头节流扫码（带硬件防泄漏互斥锁）、拖拽上传、以及添加/导入弹窗内直接 `Ctrl+V` 粘贴截图。
+- **严格防静默损坏校验**：支持标准 RFC 4648 带 `=` 填充的 `otpauth://` 链接与 Google Authenticator 批量迁移码（`otpauth-migration://`），严格拦截误输字符（如 `0/1/8/9` 或十六进制串）并明确提示不支持的 HOTP / 7 位口令条目，绝不静默丢字。
+- **独立密码加密备份**：支持导出 **PBKDF2 (300,000 次) + AES-256-GCM 加密备份包 (`.enc.json`)**，同时兼容明文 JSON、`{ accounts, groups }` 备份及多行 `otpauth://` 文本导入，按解码后密钥字节精准去重。
 
 ---
 
@@ -48,126 +40,67 @@
 
 ```mermaid
 flowchart LR
-  Browser["浏览器客户端\nWeb Crypto RFC 6238 TOTP"]
-  Worker["Cloudflare Worker\n鉴权 · 限流 · CSRF · 加解密"]
-  D1[("Cloudflare D1 (SQLite)\ntokens / sessions / rate_limits")]
+  Browser["浏览器客户端 (Web Crypto)\nPBKDF2 600k -> AES-256-GCM\n本地解密 + TOTP 计算 + 离线缓存"]
+  Worker["Cloudflare Worker\nHTTPS 强制 · 鉴权 · 原子限流 · CSRF"]
+  D1[("Cloudflare D1 (SQLite)\nvault_meta / tokens(v4 密文) / sessions / rate_limits")]
 
-  Browser -- "HTTPS + __Host- Cookie\n+ X-Vault-Client Header" --> Worker
-  Worker -- "PBKDF2-SHA256 (100k)\nAES-256-GCM + Row AAD" --> D1
+  Browser -- "HTTPS + __Host- Cookie + Origin/CSRF\n仅传输 v4 密文 (服务端零明文)" --> Worker
+  Worker -- "参数化 SQL 批处理\n仅存储密文与加盐 HMAC 会话指纹" --> D1
 ```
 
-### 安全机制一览（已通过多轮安全审计）
+### 安全防线矩阵
 
 | 防护维度 | 实现细节 |
 | :--- | :--- |
-| **身份认证** | 用户名与密码存储在 Cloudflare Workers Secret 环境变量（`AUTH_USERNAME` / `AUTH_PASSWORD`），不开放外部注册；服务端使用 SHA-256 摘要做常量时间比对（防时序侧信道）。 |
-| **防暴力破解与防喷洒** | 基于 D1 `rate_limits` 表的双层限流：**单 IP 限制**（仅信任 Cloudflare 边缘注入的 `CF-Connecting-IP`，防 `X-Forwarded-For` 伪造，15 分钟内最多 8 次失败）+ **全局防分布式代理池限制**（5 分钟内全局最多 40 次失败），超限返回 `429` 与 `Retry-After`。 |
-| **会话管理与即时吊销** | 登录签发 256-bit 随机令牌，仅将 `SHA-256(sid)` 与账号密码指纹 `auth_fp` 存入 D1 `sessions` 表（上限保留最近 20 个活跃会话）。HTTPS 下强制使用 `__Host-vault_session` 前缀 Cookie（`HttpOnly; Secure; SameSite=Strict; Path=/`）。点击退出立即从 D1 销毁会话；修改 Worker 密码后所有历史会话立即自动失效。 |
-| **三层 CSRF 防护** | 全部写操作（`POST` / `PUT` / `DELETE`）强制校验：① 自定义请求头 `X-Vault-Client: 1`；② `Origin` 必须严格等于当前源；③ `Sec-Fetch-Site` 仅允许 `same-origin` / `none`，彻底阻断跨站及同 `workers.dev` 兄弟子域请求伪造。 |
-| **D1 落盘加密与防篡改** | 使用 `ENCRYPTION_KEY` 经 **PBKDF2-SHA256（100,000 次迭代）** 派生 256 位密钥，每个令牌使用独立 96-bit 随机 IV 进行 **AES-256-GCM** 加密，并将记录主键 `id` 作为 **AAD（附加认证数据）** 绑定到密文，防止数据库行间密文替换攻击。 |
-| **严格 CSP 与防 XSS** | 每次响应生成 128-bit 随机密码学 Nonce，启用无 `'unsafe-inline'` 的严格 `Content-Security-Policy`（`script-src 'self' 'nonce-...'`, `style-src 'self'`），配合全量 HTML 转义、SVG 节点净化以及 `HSTS` / `X-Frame-Options: DENY` / `COOP` / `CORP` / `Permissions-Policy` 响应头。 |
-| **防 DoS 与隐私细节** | 流式读取请求体并限制最大 `512 KB`（超限立即中断流并返回 `413`）；编辑已有令牌时密钥默认掩码隐藏；敏感输入框禁用浏览器表单自动填充历史（`autocomplete="off"`）。 |
+| **端到端零知识加密** | 浏览器本地 `PBKDF2-SHA256`（600,000 次，32 字节随机盐）派生不可导出 `AES-256-GCM` 密钥（强制校验 96-bit IV 与 128-bit Tag），主键 UUID 写入 AAD；服务端、D1 与前置 CDN 均无法解密任何令牌内容。 |
+| **身份认证与会话指纹** | 登录凭据采用 `crypto.subtle.timingSafeEqual` 常量时间摘要比对；D1 `sessions.auth_fp` 使用每实例独立 32 字节随机盐 + 100,000 次 PBKDF2 派生的 `HMAC-SHA256` 签名（杜绝数据库泄露后的单轮哈希离线破解）。 |
+| **防并发爆破与防锁死限流** | 基于 SQLite `INSERT ... ON CONFLICT DO UPDATE RETURNING` 原子预占配额（消除并发 TOCTOU 竞态）；自动将 IPv6 地址归并至 `/64` 子网前缀防地址池轮换；全局喷洒检测采用渐进式延迟（Tarpit）而非一刀切锁死合法主人登录。 |
+| **强制 HTTPS 与会话安全** | 非本地回环地址强制 HTTPS（防反代 HTTP 回源降级）；签发 256-bit 随机令牌与 `__Host-vault_session`（`HttpOnly; Secure; SameSite=Strict; Path=/`）；支持一键吊销其他全部设备会话。 |
+| **严格三层 CSRF 防护** | 所有状态变更请求（`POST` / `PUT` / `DELETE`）强制要求：① `X-Vault-Client: 1`；② 非空且严格匹配白名单的 `Origin`（禁止 `*` 通配符）；③ 合法 `Sec-Fetch-Site`。 |
+| **严格 CSP 与供应链加固** | 每次页面请求生成 128-bit 随机密码学 Nonce，无 `'unsafe-inline'`；GitHub Actions 锁定最小只读权限与完整 40 位 Commit SHA，并在云端部署前自动执行零依赖语法与模块沙箱校验。 |
 
 ---
 
-## 目录结构
+## 部署指南（全程云端，零本地编译）
 
-项目采用纯原生 ES Modules 拆分，**无需任何构建打包工具**即可直接运行在 Cloudflare Workers Runtime：
+### 第一步：创建并绑定 Cloudflare D1 数据库
+1. 在 Cloudflare Dashboard → **Storage & Databases → D1 SQL Database** 创建数据库 `cf-2fa-vault-db`。
+2. 将生成的 UUID 填入 [wrangler.toml](wrangler.toml) 的 `database_id`（首次访问时自动建表）。
 
-```text
-.
-├── .github/workflows/
-│   └── deploy.yml          # GitHub Actions 零构建自动部署工作流
-├── docs/screenshots/       # 界面预览截图
-├── src/
-│   ├── worker.js           # Worker 入口：路由、CSP、CSRF、限流、会话与 D1 加解密
-│   ├── html.js             # 响应式页面骨架（含动态 CSP Nonce 注入）
-│   ├── styles.js           # 浅色/深色双主题与移动端适配样式表 (/app.css)
-│   ├── client.js           # 前端交互、缓存式 TOTP 引擎、扫码与导入导出 (/app.js)
-│   ├── pwa.js              # Web App Manifest 与矢量图标 (/manifest.json, /icon.svg)
-│   └── vendor/
-│       ├── jsqr.js         # 自托管二维码图像解码库（按需懒加载）
-│       └── qrcode.js       # 自托管二维码 SVG 生成库（按需懒加载）
-├── wrangler.toml           # Cloudflare Workers 与 D1 数据库绑定配置
-└── README.md
-```
-
----
-
-## 部署指南（零本地依赖）
-
-### 第一步：创建 Cloudflare D1 数据库
-
-1. 登录 Cloudflare Dashboard → **Storage & Databases** → **D1 SQL Database** → 点击 **Create Database**，命名为 `cf-2fa-vault-db`。
-2. 复制生成的 `Database ID`（UUID 格式），修改仓库根目录 [wrangler.toml](wrangler.toml) 中的 `database_id`：
-   ```toml
-   name = "cf-2fa-vault"
-   main = "src/worker.js"
-   compatibility_date = "2025-01-01"
-
-   [[d1_databases]]
-   binding = "DB"
-   database_name = "cf-2fa-vault-db"
-   database_id = "替换为你的-D1-Database-ID"
-   ```
-   > 首次访问时 Worker 会自动创建所需的 `tokens`、`sessions`、`rate_limits` 表及索引，无需手动执行 SQL 迁移。
-
-### 第二步：关联 GitHub 自动部署（二选一）
-
-#### 方案 A：使用内置 GitHub Actions（已配置就绪）
-在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 中添加以下两个 Repository Secrets：
-- `CLOUDFLARE_ACCOUNT_ID`：你的 Cloudflare Account ID
+### 第二步：配置云端自动部署
+在 GitHub 仓库 **Settings → Secrets and variables → Actions** 中配置：
+- `CLOUDFLARE_ACCOUNT_ID`：Cloudflare Account ID
 - `CLOUDFLARE_API_TOKEN`：具备 **Workers Scripts (Edit)** 与 **D1 (Edit)** 权限的 API Token
 
-之后每次向 `main` 分支推送代码，[.github/workflows/deploy.yml](.github/workflows/deploy.yml) 会自动将最新源码部署到 Cloudflare。
+推送代码至 `main` 分支后，[.github/workflows/deploy.yml](.github/workflows/deploy.yml) 将在云端自动完成语法校验并发布至 Cloudflare Workers。
 
-#### 方案 B：使用 Cloudflare 原生 Git 集成
-在 Cloudflare Dashboard → **Workers & Pages** → 选择该 Worker → **Settings → Builds → Connect** 关联你的 GitHub 仓库（Build command 留空即可）。
-
-### 第三步：配置登录账号与加密密钥（必做）
-
-部署完成后，进入 Cloudflare Dashboard → **Workers & Pages** → `cf-2fa-vault` → **Settings → Variables and Secrets**，添加以下 **Secret** 类型变量（Secret 不会被后续 Git 部署覆盖，也不会暴露在代码仓库中）：
+### 第三步：配置 Worker 环境变量（建议全部使用 Secret 类型）
+进入 Cloudflare Dashboard → **Workers & Pages → `2fa-cfworker` → Settings → Variables and Secrets**：
 
 | 变量名 | 类型 | 必填 | 说明 |
 | :--- | :--- | :---: | :--- |
-| `AUTH_USERNAME` | Secret | 是 | 登录用户名（如 `admin`） |
-| `AUTH_PASSWORD` | Secret | 是 | 登录密码（建议使用高强度密码；修改密码后所有已登录设备会立即自动登出） |
-| `ENCRYPTION_KEY` | Secret | 推荐 | 任意高熵随机字符串（如 32 字节 Base64），用于派生 D1 数据库存储密钥。单独配置后，日后修改 `AUTH_PASSWORD` 不会影响已存储的 2FA 数据 |
-| `ALLOWED_ORIGINS` | Text / Secret | 选填 | 当通过 **EdgeOne / 其他 CDN CNAME 反代回源**（回源改写了 `Host` 头）时填写你的访问域名。支持裸域名、泛域名或完整 Origin，多个用逗号分隔，例如：`2fa.example.com, *.example.org` |
-
-> **国内网络访问与 EdgeOne / CDN 反代提示**：
-> - 方式一：在 Cloudflare Worker 的 **Settings → Domains & Routes** 直接绑定托管在 Cloudflare 的自定义域名（无需配置 `ALLOWED_ORIGINS`）。
-> - 方式二：使用腾讯云 EdgeOne / 阿里云 ESA 等国内 CDN CNAME 到 `*.workers.dev` 并改写回源 Host 时，只需在 Worker 变量中添加 `ALLOWED_ORIGINS` 填入你的前端域名（如 `2fa.yourdomain.com` 或 `*.yourdomain.com`）。静态资源（`/app.css`、`/app.js` 等）会自动被 CDN 边缘强缓存加速，而 HTML 与 `/api/*` 自动带 `CDN-Cache-Control: no-store` 绝不误缓存隐私数据。
+| `AUTH_USERNAME` | Secret | 是 | 云端账户登录用户名 |
+| `AUTH_PASSWORD` | Secret | 是 | 云端账户登录密码（修改后所有已登录会话立即失效，不影响 E2EE 令牌数据） |
+| `ENCRYPTION_KEY` | Secret | **是** | 高熵随机密钥（建议 32 字节 Base64/Hex），用于服务端高成本会话指纹保护与旧版 `v3` 数据平滑迁移 |
+| `ALLOWED_ORIGINS` | Secret / Text | 选填 | 使用 EdgeOne / 阿里云 ESA 等 CDN CNAME 反代并改写回源 `Host` 时填写前端访问域名（逗号分隔，不支持 `*`，如 `2fa.example.com`） |
+| `TRUSTED_PROXY_SECRET` | Secret | 选填 | 反代回源鉴权密钥（让 CDN 回源注入请求头 `X-Proxy-Secret: <该值>`），验签通过后才会信任上游传入的访客 IP 头以保证限流精准 |
+| `TRUSTED_IP_HEADER` | Text | 选填 | 配合 `TRUSTED_PROXY_SECRET` 指定真实 IP 头名称（默认依次读取 `EO-Connecting-IP`、`X-Real-IP`、`X-Forwarded-For`） |
 
 ---
 
-## 导入格式说明
-
-点击顶栏右侧下载/导入图标打开 **「导入与导出」** 弹窗，可直接导入以下任意格式：
-
-1. **本应用标准备份 (`cf-2fa-vault-backup.json`)**：完整保留 `issuer`、`account`、`secret`、`digits`、`period`、`algo`、`tag`、`pinned`。
-2. **第三方网页验证器备份 (`{ accounts, groups }`)**：自动将 `accounts[].name` 映射为账号、`algorithm` 映射为标准哈希算法、并将 `groupId` 关联 `groups[].name` 自动转换为分类标签。
-3. **`otpauth://` 文本列表 (`.txt`)**：每行一条标准 `otpauth://totp/Issuer:Account?secret=...` 链接（兼容 Bitwarden、1Password、2FAS、Aegis 等导出格式）。
-4. **Google Authenticator 迁移码**：直接上传手机端导出的迁移二维码截图，或粘贴 `otpauth-migration://offline?data=...` 链接，自动批量解包全部 TOTP 账号。
-
----
-
-## 快捷键与接口概览
-
-### 快捷键
-- `/` 或 `Ctrl + K`（macOS 为 `Cmd + K`）：快速聚焦搜索框
-- `Esc`：关闭当前打开的弹窗或取消确认框
-
-### 内部 API 列表
+## 内部 API 概览
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
-| `GET` | `/api/health` | 健康检查（返回 D1 连通性与环境变量就绪状态） |
-| `GET` | `/api/bootstrap` | 首屏单次往返初始化（校验会话并并发解密全部令牌 + 返回服务端时间戳） |
-| `POST` | `/api/auth/login` | 登录鉴权（含双层限流保护，成功下发 `__Host-` 会话 Cookie 并返回令牌列表） |
-| `POST` | `/api/auth/logout` | 退出登录（立即从 D1 吊销当前会话并清除 Cookie） |
-| `GET` | `/api/tokens` | 获取全部解密后的令牌列表 |
-| `POST` | `/api/tokens` | 新增单条 2FA 令牌（校验后使用 AES-256-GCM + AAD 写入 D1） |
-| `POST` | `/api/tokens/import` | 批量加密导入令牌（单次最多 500 条，使用 `D1.batch` 原子写入） |
-| `PUT` | `/api/tokens/:id` | 更新指定令牌内容或切换置顶状态 |
+| `GET / HEAD` | `/api/health` | 健康检查（返回 D1 状态、环境变量完备度与 E2EE 初始化状态） |
+| `GET` | `/api/bootstrap` | 首屏单次往返初始化（校验会话并返回 E2EE 元数据、`v4` 密文列表与边缘时间戳） |
+| `POST` | `/api/auth/login` | 登录鉴权（含原子级 IPv6 `/64` 限流保护，签发 `__Host-` 会话 Cookie） |
+| `POST` | `/api/auth/logout` | 退出当前登录会话并清理 Cookie |
+| `POST` | `/api/sessions/revoke-others` | 一键吊销除当前浏览器外的所有其他活跃会话 |
+| `POST` | `/api/e2ee/legacy-export` | 一次性导出旧版 `v3` 条目供浏览器本地升级重加密为 `v4` 零知识密文 |
+| `POST` | `/api/e2ee/setup` | 初始化 E2EE 配置、提交 `v3 -> v4` 迁移密文或原子轮换端到端主密码 |
+| `GET` | `/api/tokens` | 获取全部 `v4` 密文记录列表 |
+| `POST` | `/api/tokens` | 新增单条客户端已加密的 `v4` 令牌记录 |
+| `POST` | `/api/tokens/import` | 批量写入客户端已加密的 `v4` 令牌（自动分批，单库上限 1,000 条） |
+| `PUT` | `/api/tokens/:id` | 更新指定 `v4` 密文记录或切换置顶状态（置顶不污染 `updated_at`） |
 | `DELETE` | `/api/tokens/:id` | 永久删除指定令牌 |

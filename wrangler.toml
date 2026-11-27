@@ -8,8 +8,10 @@ binding = "DB"
 database_name = "cf-2fa-vault-db"
 database_id = "093b4a59-ae0c-49fe-894d-12a9374c3e87"
 
-# 在 Cloudflare Dashboard -> Workers & Pages -> 2fa-cfworker -> Settings -> Variables and Secrets 中配置：
-#   AUTH_USERNAME   (必填) 登录用户名，如 admin
-#   AUTH_PASSWORD   (必填) 登录密码（建议使用 Secret 加密存储）
-#   ENCRYPTION_KEY  (推荐) 高熵随机密钥，用于 D1 落盘 AES-256-GCM 加密；修改登录密码不影响已有数据
-#   ALLOWED_ORIGINS (可选) 当使用 EdgeOne / CDN CNAME 反代回源时填写允许的前端域名（逗号分隔，支持如 2fa.example.com, *.example.com）
+# 在 Cloudflare Dashboard -> Workers & Pages -> 2fa-cfworker -> Settings -> Variables and Secrets 中配置（强烈建议全部设为 Secret 类型）：
+#   AUTH_USERNAME        (必填) 云端登录用户名
+#   AUTH_PASSWORD        (必填) 云端登录密码（修改后所有历史登录会话立即自动失效，不影响端到端加密数据）
+#   ENCRYPTION_KEY       (必填) 至少 16 位高熵随机字符串，用于服务端每实例随机盐 HMAC 会话指纹保护及旧版 v3 数据平滑迁移
+#   ALLOWED_ORIGINS      (可选) 使用 EdgeOne / 阿里云 ESA 等 CNAME 反代并改写 Host 时填写前端域名（逗号分隔，禁止 *，如 2fa.example.com, *.example.com）
+#   TRUSTED_PROXY_SECRET (可选) 反代回源自定义共享密钥（对应请求头 X-Proxy-Secret），验签通过后读取真实访客 IP 头用于精准限流
+#   TRUSTED_IP_HEADER    (可选) 自定义真实访客 IP 请求头名（默认依次读取 EO-Connecting-IP / X-Real-IP / X-Forwarded-For）

@@ -7,15 +7,40 @@ on:
       - master
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-cloudflare-worker-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    name: Deploy cf-2fa-vault
+    name: Validate & Deploy 2fa-cfworker (Zero-Build)
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source (pinned SHA)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Deploy Worker (zero-build)
-        uses: cloudflare/wrangler-action@v3
+      - name: Cloud syntax & bundle sanity check (zero dependencies)
+        run: |
+          node --input-type=module -e '
+            import worker from "./src/worker.js";
+            import { CLIENT_JS_SRC } from "./src/client.js";
+            import { renderServiceWorker } from "./src/pwa.js";
+            import { QRCODE_SRC } from "./src/vendor/qrcode.js";
+            import { JSQR_SRC } from "./src/vendor/jsqr.js";
+            import vm from "node:vm";
+            if (typeof worker?.fetch !== "function") throw new Error("Missing worker.fetch");
+            new vm.Script(CLIENT_JS_SRC, { filename: "app.js" });
+            new vm.Script(renderServiceWorker("000000000000"), { filename: "sw.js" });
+            new vm.Script(QRCODE_SRC, { filename: "qrcode.js" });
+            new vm.Script(JSQR_SRC, { filename: "jsqr.js" });
+            console.log("Cloud zero-build validation passed.");
+          '
+
+      - name: Deploy Worker to Cloudflare (pinned SHA)
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
